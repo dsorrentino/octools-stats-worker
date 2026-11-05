@@ -15,3 +15,12 @@ database_id = "81e0f9fa-cacc-49f6-90d8-18f6cba834ea"
 [vars]
 ENVIRONMENT = "production"
 # ADMIN_TOKEN is a Worker secret, never a var: `wrangler secret put ADMIN_TOKEN`
+
+# Global write rate limit (Workers Rate Limiting). The worker falls back to a
+# per-isolate limiter when this binding is absent. period must be 10 or 60.
+[[ratelimits]]
+name = "WRITE_LIMITER"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 20
+  period = 60

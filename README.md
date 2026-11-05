@@ -43,6 +43,26 @@ npx wrangler secret put ADMIN_TOKEN < <that file>
 
 An old value that was ever committed must be treated as public and rotated, not just moved.
 
+The worker compares the token in constant time and **fails closed** if `ADMIN_TOKEN` is unset or empty. Repeated failed admin attempts from one IP are throttled (10 per minute, then HTTP 429); successful requests, such as a full `seed.js` run, are not limited.
+
+## Rate limits
+
+Writes (`/v1/stats/download`, `/v1/stats/rating`) are limited to 20 per minute per client IP.
+
+- With the `WRITE_LIMITER` binding in `wrangler.toml` (Workers Rate Limiting), the limit is global across all Cloudflare locations.
+- Without it, the worker falls back to a per-isolate in-memory limiter. That is weaker, because each isolate counts separately.
+
+## Testing locally
+
+Nothing here touches production:
+
+```bash
+npm ci
+for f in schema*.sql; do npx wrangler d1 execute octools-stats --local --file=$f; done
+npx wrangler dev --local --var ADMIN_TOKEN:local-test-token
+curl -s localhost:8787/health
+```
+
 ## Deploying
 
 There is no CI; deploys are manual with a Cloudflare API token that has Workers and D1 permissions:

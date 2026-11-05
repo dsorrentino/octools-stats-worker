@@ -20,6 +20,11 @@
 export interface Env {
   DB: D1Database;
   ADMIN_TOKEN: string;
+  /**
+   * Optional Workers Rate Limiting binding ([[ratelimits]] in wrangler.toml).
+   * When bound, write limits are enforced globally instead of per isolate.
+   */
+  WRITE_LIMITER?: RateLimit;
 }
 
 /* ------------------------------------------------------------------ */
@@ -47,32 +52,72 @@ function errorResponse(status: number, message: string): Response {
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 
 /* ------------------------------------------------------------------ */
-/*  Rate limiter (simple in-memory, per-isolate)                      */
+/*  Rate limiters                                                     */
 /* ------------------------------------------------------------------ */
 
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
 const RATE_LIMIT_MAX = 20; // max writes per IP per minute
+const ADMIN_FAIL_MAX = 10; // max failed admin auth attempts per IP per minute
 
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return false;
+/** In-memory fixed-window limiter. Per isolate, so only a fallback/extra layer. */
+function makeLimiter(max: number) {
+  const entries = new Map<string, { count: number; resetAt: number }>();
+  return (key: string): boolean => {
+    const now = Date.now();
+    // Drop expired entries now and then so the map can't grow without bound.
+    if (entries.size > 10_000) {
+      for (const [k, e] of entries) if (now > e.resetAt) entries.delete(k);
+    }
+    const entry = entries.get(key);
+    if (!entry || now > entry.resetAt) {
+      entries.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+      return false;
+    }
+    entry.count++;
+    return entry.count > max;
+  };
+}
+
+const isLocallyRateLimited = makeLimiter(RATE_LIMIT_MAX);
+const tooManyAdminFailures = makeLimiter(ADMIN_FAIL_MAX);
+
+/**
+ * Write rate limit: global when the WRITE_LIMITER binding is configured,
+ * otherwise the per-isolate fallback (same limit as before).
+ */
+async function isRateLimited(ip: string, env: Env): Promise<boolean> {
+  if (env.WRITE_LIMITER) {
+    try {
+      const { success } = await env.WRITE_LIMITER.limit({ key: ip });
+      return !success;
+    } catch {
+      // Binding misconfigured or unavailable: fall back rather than fail open entirely.
+    }
   }
-  entry.count++;
-  return entry.count > RATE_LIMIT_MAX;
+  return isLocallyRateLimited(ip);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Auth helper                                                       */
 /* ------------------------------------------------------------------ */
 
-function isAuthorized(request: Request, env: Env): boolean {
+async function sha256(value: string): Promise<ArrayBuffer> {
+  return crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+}
+
+/**
+ * Admin bearer token check. Fails closed when ADMIN_TOKEN is unset or empty, and
+ * compares fixed-length digests in constant time so response timing doesn't leak
+ * how much of a guess was right.
+ */
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  const expected = (env.ADMIN_TOKEN || '').trim();
+  if (!expected) return false;
   const authHeader = request.headers.get('Authorization') || '';
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  return token === env.ADMIN_TOKEN;
+  if (!token) return false;
+  const [a, b] = await Promise.all([sha256(token), sha256(expected)]);
+  return crypto.subtle.timingSafeEqual(a, b);
 }
 
 /* ------------------------------------------------------------------ */
@@ -406,8 +451,12 @@ async function handleGetVersionsByTool(db: D1Database, toolId: string): Promise<
   return json({ toolId, versions }, 200, 300);
 }
 
-async function handlePostVersion(request: Request, db: D1Database, env: Env): Promise<Response> {
-  if (!isAuthorized(request, env)) {
+async function handlePostVersion(request: Request, db: D1Database, env: Env, ip: string): Promise<Response> {
+  if (!(await isAuthorized(request, env))) {
+    // Throttle repeated failures per IP (successful seeding is not limited).
+    if (tooManyAdminFailures(ip)) {
+      return errorResponse(429, 'Too many failed admin attempts. Try again later.');
+    }
     return errorResponse(401, 'Unauthorized: invalid or missing admin token');
   }
 
@@ -544,27 +593,27 @@ export default {
     // Write endpoints — rate limit
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
 
-    // POST /v1/versions — admin-only upsert (no rate limit for admin)
+    // POST /v1/versions — admin-only upsert (failed auth attempts are throttled)
     if (pathname === '/v1/versions' && method === 'POST') {
-      return handlePostVersion(request, env.DB, env);
+      return handlePostVersion(request, env.DB, env, ip);
     }
 
     if (pathname === '/v1/stats/download' && method === 'POST') {
-      if (isRateLimited(ip)) {
+      if (await isRateLimited(ip, env)) {
         return errorResponse(429, 'Rate limited. Try again later.');
       }
       return handlePostDownload(request, env.DB);
     }
 
     if (pathname === '/v1/stats/rating' && method === 'POST') {
-      if (isRateLimited(ip)) {
+      if (await isRateLimited(ip, env)) {
         return errorResponse(429, 'Rate limited. Try again later.');
       }
       return handlePostRating(request, env.DB);
     }
 
     if (pathname === '/v1/stats/rating' && method === 'DELETE') {
-      if (isRateLimited(ip)) {
+      if (await isRateLimited(ip, env)) {
         return errorResponse(429, 'Rate limited. Try again later.');
       }
       return handleDeleteRating(request, env.DB);
