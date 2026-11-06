@@ -15,6 +15,9 @@
  *   POST /v1/versions           — upsert a version row (admin-only)
  *   GET  /v1/catalog            — catalog format with stats + versions
  *   GET  /health                — health check
+ *
+ * Writes from storefronts (downloads, ratings) are accepted only for tool ids that
+ * have published version rows, so the counters can't be filled with arbitrary ids.
  */
 
 export interface Env {
@@ -50,6 +53,40 @@ function errorResponse(status: number, message: string): Response {
 }
 
 const SHA256_RE = /^[a-f0-9]{64}$/i;
+/** Catalog ids are Kubernetes names (DNS-1123 labels), e.g. oct-baremetal. */
+const TOOL_ID_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+const SEMVER_RE = /^v?\d+\.\d+\.\d+$/;
+/** Same cap the storefront applies to unknown declaration keys. */
+const SECURITY_MAX_BYTES = 16 * 1024;
+
+/** True when toolId is well-formed and has at least one published version row. */
+async function isKnownTool(db: D1Database, toolId: string): Promise<boolean> {
+  if (!TOOL_ID_RE.test(toolId)) return false;
+  const row = await db.prepare('SELECT 1 AS ok FROM tool_versions WHERE tool_id = ? LIMIT 1').bind(toolId).first<{ ok: number }>();
+  return !!row;
+}
+
+/**
+ * A security declaration from seed.js, stored as JSON text. Returns undefined when
+ * absent, null to clear, or an error message.
+ */
+function securityJson(v: unknown): string | null | undefined | { error: string } {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return { error: 'security must be an object' };
+  const text = JSON.stringify(v);
+  if (text.length > SECURITY_MAX_BYTES) return { error: `security is larger than ${SECURITY_MAX_BYTES} bytes` };
+  return text;
+}
+
+function parseJsonColumn(text: string | null): unknown {
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /*  Rate limiters                                                     */
@@ -132,6 +169,8 @@ interface ToolVersionRow {
   image: string;
   git_ref: string | null;
   deploy_url: string | null;
+  min_storefront?: string | null;
+  security?: string | null;
   updated_at: string;
 }
 
@@ -155,8 +194,8 @@ interface VersionEntry {
  */
 async function handleGetCatalog(db: D1Database): Promise<Response> {
   const statsRows = await db
-    .prepare('SELECT tool_id, downloads, category, description, display_name, href, icon, git FROM tools_stats')
-    .all<{ tool_id: string; downloads: number; category: string | null; description: string | null; display_name: string | null; href: string | null; icon: string | null; git: string | null }>();
+    .prepare('SELECT tool_id, downloads, category, description, display_name, href, icon, git, security FROM tools_stats')
+    .all<{ tool_id: string; downloads: number; category: string | null; description: string | null; display_name: string | null; href: string | null; icon: string | null; git: string | null; security: string | null }>();
 
   const ratingRows = await db
     .prepare(
@@ -169,7 +208,7 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
     .all<{ tool_id: string; rating_count: number; rating_avg: number }>();
 
   const versionRows = await db
-    .prepare('SELECT tool_id, version, channel, openshift, image, git_ref, deploy_url FROM tool_versions ORDER BY tool_id, version')
+    .prepare('SELECT tool_id, version, channel, openshift, image, git_ref, deploy_url, min_storefront, security FROM tool_versions ORDER BY tool_id, version')
     .all<ToolVersionRow>();
 
   interface CatalogToolEntry {
@@ -182,6 +221,7 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
     href: string | null;
     icon: string | null;
     git: string | null;
+    security?: unknown;
   }
   const toolMap = new Map<string, CatalogToolEntry>();
   for (const row of statsRows.results) {
@@ -193,6 +233,7 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
       href: row.href || null,
       icon: row.icon || null,
       git: row.git || null,
+      security: parseJsonColumn(row.security),
     });
   }
   for (const row of ratingRows.results) {
@@ -209,7 +250,7 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
   }
 
   // Group versions by (tool_id, version, channel) and collect openshift into arrays
-  const versionsByTool = new Map<string, Map<string, { version: string; channel: string; openshift: string[]; image: string; gitRef: string | null; deployUrl: string | null }>>();
+  const versionsByTool = new Map<string, Map<string, { version: string; channel: string; openshift: string[]; image: string; gitRef: string | null; deployUrl: string | null; minStorefront: string | null; security: unknown }>>();
   for (const row of versionRows.results) {
     if (!versionsByTool.has(row.tool_id)) {
       versionsByTool.set(row.tool_id, new Map());
@@ -227,6 +268,8 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
         image: row.image,
         gitRef: row.git_ref,
         deployUrl: row.deploy_url,
+        minStorefront: row.min_storefront || null,
+        security: parseJsonColumn(row.security || null),
       });
     }
     if (!toolMap.has(row.tool_id)) {
@@ -247,6 +290,8 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
           image: v.image,
           ...(v.gitRef ? { gitRef: v.gitRef } : {}),
           ...(v.deployUrl ? { deployUrl: v.deployUrl } : {}),
+          ...(v.minStorefront ? { minStorefront: v.minStorefront } : {}),
+          ...(v.security ? { security: v.security } : {}),
         }))
       : [];
 
@@ -259,6 +304,7 @@ async function handleGetCatalog(db: D1Database): Promise<Response> {
       ...(data.href ? { href: data.href } : {}),
       ...(data.icon ? { icon: data.icon } : {}),
       ...(data.git ? { git: data.git } : {}),
+      ...(data.security ? { security: data.security } : {}),
       downloads: data.downloads,
       rating: {
         average: data.ratingAvg,
@@ -330,8 +376,11 @@ async function handlePostDownload(request: Request, db: D1Database): Promise<Res
   }
 
   const toolId = body.toolId?.trim();
-  if (!toolId || toolId.length > 128) {
+  if (!toolId || !TOOL_ID_RE.test(toolId)) {
     return errorResponse(400, 'Missing or invalid toolId');
+  }
+  if (!(await isKnownTool(db, toolId))) {
+    return errorResponse(404, 'Unknown toolId (no published versions)');
   }
 
   await db
@@ -357,7 +406,7 @@ async function handlePostRating(request: Request, db: D1Database): Promise<Respo
   const clusterHash = body.clusterHash?.trim();
   const stars = body.stars;
 
-  if (!toolId || toolId.length > 128) {
+  if (!toolId || !TOOL_ID_RE.test(toolId)) {
     return errorResponse(400, 'Missing or invalid toolId');
   }
   if (!clusterHash || !SHA256_RE.test(clusterHash)) {
@@ -365,6 +414,9 @@ async function handlePostRating(request: Request, db: D1Database): Promise<Respo
   }
   if (typeof stars !== 'number' || stars < 1 || stars > 5 || !Number.isInteger(stars)) {
     return errorResponse(400, 'stars must be an integer between 1 and 5');
+  }
+  if (!(await isKnownTool(db, toolId))) {
+    return errorResponse(404, 'Unknown toolId (no published versions)');
   }
 
   await db
@@ -391,8 +443,8 @@ async function handleDeleteRating(request: Request, db: D1Database): Promise<Res
   const toolId = body.toolId?.trim();
   const clusterHash = body.clusterHash?.trim();
 
-  if (!toolId) {
-    return errorResponse(400, 'Missing toolId');
+  if (!toolId || !TOOL_ID_RE.test(toolId)) {
+    return errorResponse(400, 'Missing or invalid toolId');
   }
   if (!clusterHash || !SHA256_RE.test(clusterHash)) {
     return errorResponse(400, 'Invalid clusterHash');
@@ -474,6 +526,11 @@ async function handlePostVersion(request: Request, db: D1Database, env: Env, ip:
     href?: string;
     icon?: string;
     git?: string;
+    minStorefront?: string;
+    /** spec.security of the tool (object), or null to clear it. */
+    security?: unknown;
+    /** versions[].security of this row (object), or null to clear it. */
+    versionSecurity?: unknown;
   };
   try {
     body = await request.json();
@@ -494,9 +551,18 @@ async function handlePostVersion(request: Request, db: D1Database, env: Env, ip:
   const href = body.href?.trim() || null;
   const icon = body.icon?.trim() || null;
   const git = body.git?.trim() || null;
+  const minStorefront = body.minStorefront?.trim() || null;
+  const security = securityJson(body.security);
+  const versionSecurity = securityJson(body.versionSecurity);
 
-  if (!toolId || toolId.length > 128) {
-    return errorResponse(400, 'Missing or invalid toolId');
+  if (!toolId || !TOOL_ID_RE.test(toolId)) {
+    return errorResponse(400, 'Missing or invalid toolId (a DNS-1123 name such as oct-my-tool)');
+  }
+  if (minStorefront && !SEMVER_RE.test(minStorefront)) {
+    return errorResponse(400, 'minStorefront must be a semver such as 1.6.0');
+  }
+  for (const [name, v] of [['security', security], ['versionSecurity', versionSecurity]] as const) {
+    if (v && typeof v === 'object') return errorResponse(400, `${name}: ${v.error}`);
   }
   if (!version) {
     return errorResponse(400, 'Missing version');
@@ -510,15 +576,28 @@ async function handlePostVersion(request: Request, db: D1Database, env: Env, ip:
 
   await db
     .prepare(
-      `INSERT INTO tool_versions (tool_id, version, channel, openshift, image, git_ref, deploy_url, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      `INSERT INTO tool_versions (tool_id, version, channel, openshift, image, git_ref, deploy_url, min_storefront, security, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT(tool_id, version, openshift)
        DO UPDATE SET channel = excluded.channel, image = excluded.image,
                      git_ref = excluded.git_ref, deploy_url = excluded.deploy_url,
+                     min_storefront = excluded.min_storefront, security = excluded.security,
                      updated_at = datetime('now')`
     )
-    .bind(toolId, version, channel, openshift, image, gitRef, deployUrl)
+    .bind(toolId, version, channel, openshift, image, gitRef, deployUrl, minStorefront, (versionSecurity as string | null | undefined) ?? null)
     .run();
+
+  // The tool-level declaration is replaced whenever seed.js sends the field
+  // (an object sets it, null clears it); omitting the field leaves it alone.
+  if (security !== undefined) {
+    await db
+      .prepare(
+        `INSERT INTO tools_stats (tool_id, downloads, security) VALUES (?, 0, ?)
+         ON CONFLICT(tool_id) DO UPDATE SET security = excluded.security`
+      )
+      .bind(toolId, security as string | null)
+      .run();
+  }
 
   const hasMetadata = category || description || displayName || href || icon || git;
   if (hasMetadata) {
@@ -566,7 +645,7 @@ export default {
 
     // Health check
     if (pathname === '/health' && method === 'GET') {
-      return json({ ok: true, version: '1.1.0' });
+      return json({ ok: true, version: '1.2.0' });
     }
 
     // GET stats (read-only, cached)
