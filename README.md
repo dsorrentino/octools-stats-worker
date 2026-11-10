@@ -16,7 +16,7 @@ Cloudflare Worker behind **https://api.octools.net**: the public catalog API for
 | POST | `/v1/stats/download` | none, rate-limited | Increment downloads (storefront Add; known tools only) |
 | POST / DELETE | `/v1/stats/rating` | none, rate-limited | Upsert / remove a rating (deduped by cluster hash; known tools only) |
 
-Version rows are keyed by `(toolId, version, openshift)`: **one row per OpenShift minor**, `openshift` is a single string and `image` is that minor's combined tag. Optional fields: `channel`, `gitRef`, `deployUrl`, `minStorefront` (semver), `versionSecurity` (the row's `versions[].security`), tile metadata (`category`, `description`, `displayName`, `href`, `icon`, `git`), and `security` (the tool's `spec.security`; an object sets it, `null` clears it, omitting it leaves it unchanged). Declarations are capped at 16 KB. `/v1/catalog` returns `security` per tool and `minStorefront` / `security` per version; storefronts older than 1.6 ignore them.
+Version rows are keyed by `(toolId, version, openshift)`: **one row per OpenShift minor**, `openshift` is a single string and `image` is that minor's combined tag. Optional fields: `channel`, `gitRef`, `deployUrl`, `minStorefront` (semver), `versionSecurity` (the row's `versions[].security`; like `security`, an object sets it, `null` clears it, omitting it leaves it unchanged), tile metadata (`category`, `description`, `displayName`, `href`, `icon`, `git`), and `security` (the tool's `spec.security`; an object sets it, `null` clears it, omitting it leaves it unchanged). Declarations are capped at 16 KB. `/v1/catalog` returns `security` per tool and `minStorefront` / `security` per version; storefronts older than 1.6 ignore them.
 
 **Writes from storefronts are accepted only for known tools:** a `toolId` must be a DNS-1123 name with at least one published version row, otherwise downloads and ratings get 404. Seed a new tool's rows before announcing it, or its first downloads won't count (storefronts ignore the error).
 
@@ -51,8 +51,11 @@ The worker compares the token in constant time and **fails closed** if `ADMIN_TO
 
 Writes (`/v1/stats/download`, `/v1/stats/rating`) are limited to 20 per minute per client IP.
 
-- With the `WRITE_LIMITER` binding in `wrangler.toml` (Workers Rate Limiting), the limit is global across all Cloudflare locations.
+- With the `WRITE_LIMITER` binding in `wrangler.toml` (Workers Rate Limiting), the limit is shared by all isolates in a Cloudflare location. It is counted per location, not globally.
 - Without it, the worker falls back to a per-isolate in-memory limiter. That is weaker, because each isolate counts separately.
+- **Admin endpoints:** after 10 failed token attempts in a minute an IP gets 429, even with the right token, until the minute is over. Successful requests don't count, so seeding isn't slowed. This counter is per isolate; for a real limit add a Cloudflare WAF rate-limiting rule for `POST /v1/versions`.
+
+Known limits: ratings accept any well-formed cluster hash, so someone rotating IPs can still add rows (at most 20 writes per minute per IP); downloads and ratings are only accepted for tools with published versions.
 
 ## Testing locally
 
@@ -60,7 +63,8 @@ Nothing here touches production:
 
 ```bash
 npm ci
-for f in schema*.sql; do npx wrangler d1 execute octools-stats --local --file=$f; done
+# In order: a plain glob sorts schema-v2.sql before schema.sql.
+for f in schema.sql schema-v2.sql schema-v3.sql schema-v4.sql schema-v5.sql; do npx wrangler d1 execute octools-stats --local --file=$f; done
 npx wrangler dev --local --var ADMIN_TOKEN:local-test-token
 curl -s localhost:8787/health
 ```

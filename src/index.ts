@@ -25,7 +25,8 @@ export interface Env {
   ADMIN_TOKEN: string;
   /**
    * Optional Workers Rate Limiting binding ([[ratelimits]] in wrangler.toml).
-   * When bound, write limits are enforced globally instead of per isolate.
+   * When bound, write limits are counted per Cloudflare location (shared by the
+   * isolates there) instead of per isolate. Not a global limit.
    */
   WRITE_LIMITER?: RateLimit;
 }
@@ -116,7 +117,27 @@ function makeLimiter(max: number) {
 }
 
 const isLocallyRateLimited = makeLimiter(RATE_LIMIT_MAX);
-const tooManyAdminFailures = makeLimiter(ADMIN_FAIL_MAX);
+
+/**
+ * Failed admin attempts per IP. Checked BEFORE the token, so a blocked IP can't
+ * keep guessing (a right guess while blocked still gets 429), and only failures
+ * count, so seed.js posting many rows isn't slowed down. Per isolate: put a
+ * Cloudflare WAF rate-limiting rule on POST /v1/versions for a limit across isolates.
+ */
+const adminFailures = new Map<string, { count: number; resetAt: number }>();
+function adminBlocked(ip: string): boolean {
+  const e = adminFailures.get(ip);
+  return !!e && Date.now() <= e.resetAt && e.count >= ADMIN_FAIL_MAX;
+}
+function recordAdminFailure(ip: string): void {
+  const now = Date.now();
+  if (adminFailures.size > 10_000) {
+    for (const [k, e] of adminFailures) if (now > e.resetAt) adminFailures.delete(k);
+  }
+  const e = adminFailures.get(ip);
+  if (!e || now > e.resetAt) adminFailures.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+  else e.count++;
+}
 
 /**
  * Write rate limit: global when the WRITE_LIMITER binding is configured,
@@ -504,11 +525,11 @@ async function handleGetVersionsByTool(db: D1Database, toolId: string): Promise<
 }
 
 async function handlePostVersion(request: Request, db: D1Database, env: Env, ip: string): Promise<Response> {
+  if (adminBlocked(ip)) {
+    return errorResponse(429, 'Too many failed admin attempts. Try again later.');
+  }
   if (!(await isAuthorized(request, env))) {
-    // Throttle repeated failures per IP (successful seeding is not limited).
-    if (tooManyAdminFailures(ip)) {
-      return errorResponse(429, 'Too many failed admin attempts. Try again later.');
-    }
+    recordAdminFailure(ip);
     return errorResponse(401, 'Unauthorized: invalid or missing admin token');
   }
 
@@ -574,6 +595,9 @@ async function handlePostVersion(request: Request, db: D1Database, env: Env, ip:
     return errorResponse(400, 'Missing image');
   }
 
+  // Like the tool-level declaration: an object sets the row's security, null clears
+  // it, and omitting versionSecurity leaves the stored value alone.
+  const keepRowSecurity = body.versionSecurity === undefined;
   await db
     .prepare(
       `INSERT INTO tool_versions (tool_id, version, channel, openshift, image, git_ref, deploy_url, min_storefront, security, updated_at)
@@ -581,7 +605,8 @@ async function handlePostVersion(request: Request, db: D1Database, env: Env, ip:
        ON CONFLICT(tool_id, version, openshift)
        DO UPDATE SET channel = excluded.channel, image = excluded.image,
                      git_ref = excluded.git_ref, deploy_url = excluded.deploy_url,
-                     min_storefront = excluded.min_storefront, security = excluded.security,
+                     min_storefront = excluded.min_storefront,
+                     security = ${keepRowSecurity ? 'tool_versions.security' : 'excluded.security'},
                      updated_at = datetime('now')`
     )
     .bind(toolId, version, channel, openshift, image, gitRef, deployUrl, minStorefront, (versionSecurity as string | null | undefined) ?? null)
