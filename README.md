@@ -49,11 +49,11 @@ The worker compares the token in constant time and **fails closed** if `ADMIN_TO
 
 ## Rate limits
 
-Writes (`/v1/stats/download`, `/v1/stats/rating`) are limited to 20 per minute per client IP.
+Writes (`/v1/stats/download`, `/v1/stats/rating`) are limited to 20 per minute per client IP, counted per Cloudflare location (see below).
 
 - With the `WRITE_LIMITER` binding in `wrangler.toml` (Workers Rate Limiting), the limit is shared by all isolates in a Cloudflare location. It is counted per location, not globally.
 - Without it, the worker falls back to a per-isolate in-memory limiter. That is weaker, because each isolate counts separately.
-- **Admin endpoints:** after 10 failed token attempts in a minute an IP gets 429, even with the right token, until the minute is over. Successful requests don't count, so seeding isn't slowed. This counter is per isolate; for a real limit add a Cloudflare WAF rate-limiting rule for `POST /v1/versions`.
+- **Admin endpoints:** after 10 failed token attempts in a minute an IP gets 429 from that isolate, even with the right token, until the minute is over. Successful requests don't count, so seeding isn't slowed. This counter is per isolate; for a real limit add a Cloudflare WAF rate-limiting rule for `POST /v1/versions`.
 
 Known limits: ratings accept any well-formed cluster hash, so someone rotating IPs can still add rows (at most 20 writes per minute per IP); downloads and ratings are only accepted for tools with published versions.
 
